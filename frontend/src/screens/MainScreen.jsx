@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { collection, addDoc, Timestamp } from 'firebase/firestore';
+import { db } from '../firebase';
 import { theme } from '../theme';
 import logo from '../assets/logo.png';
 
@@ -167,8 +169,39 @@ export default function MainScreen({ onStartReplan }) {
   const [actionMsg, setActionMsg] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const [stopwatchSeconds, setStopwatchSeconds] = useState(0);
-  const [stopwatchRunning, setStopwatchRunning] = useState(false);
+  const userId = localStorage.getItem('userId') || 'guest'; // TODO: 로그인 붙으면 이 fallback 제거
+  const stopwatchStorageKey = `planit_stopwatch_${userId}`;
+
+  // 새로고침/탭 재로드/컴퓨터 절전 이후에도 진행 중이던 스톱워치가 이어지도록,
+  // localStorage에 저장해둔 값으로 초기 state를 복원한다. 실행 중이었다면
+  // 저장 시점(savedAt)부터 지금까지 흐른 실제 시간만큼 더해준다.
+  const loadStopwatch = () => {
+    try {
+      const raw = localStorage.getItem(stopwatchStorageKey);
+      if (!raw) return { seconds: 0, running: false, startedAt: null };
+      const saved = JSON.parse(raw);
+      const elapsedSincePageClosed = saved.running
+        ? Math.max(0, Math.floor((Date.now() - saved.savedAt) / 1000))
+        : 0;
+      return {
+        seconds: (saved.seconds || 0) + elapsedSincePageClosed,
+        running: !!saved.running,
+        startedAt: saved.startedAt ? new Date(saved.startedAt) : null,
+      };
+    } catch {
+      return { seconds: 0, running: false, startedAt: null };
+    }
+  };
+
+  const [stopwatchSeconds, setStopwatchSeconds] = useState(
+    () => loadStopwatch().seconds,
+  );
+  const [stopwatchRunning, setStopwatchRunning] = useState(
+    () => loadStopwatch().running,
+  );
+  const [stopwatchStartedAt, setStopwatchStartedAt] = useState(
+    () => loadStopwatch().startedAt,
+  );
 
   useEffect(() => {
     if (!stopwatchRunning) return;
@@ -176,7 +209,25 @@ export default function MainScreen({ onStartReplan }) {
     return () => clearInterval(id);
   }, [stopwatchRunning]);
 
-  const userId = localStorage.getItem('userId') || 'guest'; // TODO: 로그인 붙으면 이 fallback 제거
+  // 값이 바뀔 때마다 바로 localStorage에 백업 - 여기 있는 값이 실제 진행 상태의
+  // 유일한 저장소라서(서버에는 완료 시점에만 전송), 그 전에 새로고침/탭 재로드가
+  // 일어나도 이 백업으로 이어서 복원한다.
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        stopwatchStorageKey,
+        JSON.stringify({
+          seconds: stopwatchSeconds,
+          running: stopwatchRunning,
+          startedAt: stopwatchStartedAt ? stopwatchStartedAt.toISOString() : null,
+          savedAt: Date.now(),
+        }),
+      );
+    } catch {
+      // localStorage를 못 쓰는 환경이면 그냥 이번 세션 동안만 메모리로 유지한다.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopwatchSeconds, stopwatchRunning, stopwatchStartedAt]);
 
   const reloadPlan = () =>
     fetch(`${API_BASE}/plans/${userId}`)
@@ -233,6 +284,29 @@ export default function MainScreen({ onStartReplan }) {
     }
   };
 
+  // 스톱워치로 잰 경과 시간을 study_sessions에 기록한다 - 통계/뱃지/레이더차트
+  // (mypage-data.js, radar-metrics.js, badgeChecker.js)가 전부 이 컬렉션을
+  // memberId(=localStorage의 userId)로 조회하므로, 여기서도 반드시 그 userId를
+  // 써야 한다 (Java 체크리스트 API용 memberId와는 다른 값).
+  const recordStudySession = async () => {
+    if (stopwatchSeconds <= 0) return;
+    const startedAt =
+      stopwatchStartedAt ?? new Date(Date.now() - stopwatchSeconds * 1000);
+    await addDoc(collection(db, 'study_sessions'), {
+      memberId: userId,
+      startedAt: Timestamp.fromDate(startedAt),
+      durationSeconds: stopwatchSeconds,
+    });
+    setStopwatchRunning(false);
+    setStopwatchSeconds(0);
+    setStopwatchStartedAt(null);
+    try {
+      localStorage.removeItem(stopwatchStorageKey);
+    } catch {
+      // 지우기 실패해도 다음 렌더에서 0으로 다시 저장되므로 무시한다.
+    }
+  };
+
   // (C) "오늘 학습 마무리하기": 다 못 채웠어도 팀원 API로 하루 완료 기록을 남긴다.
   const handleCompleteDay = async () => {
     if (memberId == null) return;
@@ -244,6 +318,13 @@ export default function MainScreen({ onStartReplan }) {
         { method: 'POST' },
       );
       if (!res.ok) throw new Error('오늘 학습 마무리에 실패했습니다.');
+      try {
+        await recordStudySession();
+      } catch {
+        // 체크리스트 완료 처리는 이미 끝났으니 막지 않고, 스톱워치 기록 실패만 알린다.
+        setSaveMsg('오늘 학습을 마무리했지만, 학습 시간 기록에는 실패했어요.');
+        return;
+      }
       setSaveMsg('오늘 학습을 마무리했어요!');
     } catch (e) {
       setSaveMsg(e.message);
@@ -732,7 +813,6 @@ export default function MainScreen({ onStartReplan }) {
                 paddingBottom: 16,
               }}
             >
-              {/* TODO: 완료 처리할 때 이 경과 시간(stopwatchSeconds)도 같이 서버로 전송 */}
               <div
                 style={{
                   fontSize: 32,
@@ -748,7 +828,15 @@ export default function MainScreen({ onStartReplan }) {
                 style={{ display: 'flex', gap: 8, justifyContent: 'center' }}
               >
                 <button
-                  onClick={() => setStopwatchRunning((r) => !r)}
+                  onClick={() =>
+                    setStopwatchRunning((r) => {
+                      const next = !r;
+                      if (next && stopwatchStartedAt == null) {
+                        setStopwatchStartedAt(new Date());
+                      }
+                      return next;
+                    })
+                  }
                   style={s_btnSecondary}
                 >
                   {stopwatchRunning ? '중단' : '시작'}
@@ -757,6 +845,7 @@ export default function MainScreen({ onStartReplan }) {
                   onClick={() => {
                     setStopwatchRunning(false);
                     setStopwatchSeconds(0);
+                    setStopwatchStartedAt(null);
                   }}
                   style={s_btnSecondary}
                 >
